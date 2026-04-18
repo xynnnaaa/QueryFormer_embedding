@@ -35,7 +35,7 @@ class Prediction(nn.Module):
         
 class FeatureEmbed(nn.Module):
     def __init__(self, embed_size=32, tables = 10, types=20, joins = 40, columns= 30, \
-                 ops=4, use_sample = True, use_hist = True, bin_number = 50):
+                 ops=4, use_sample = True, use_hist = True, bin_number = 50, sample_dim = 1000, max_filters = 3):
         super(FeatureEmbed, self).__init__()
         
         self.use_sample = use_sample
@@ -43,7 +43,9 @@ class FeatureEmbed(nn.Module):
         
         self.use_hist = use_hist
         self.bin_number = bin_number
-        
+        self.sample_dim = sample_dim
+        self.max_filters = max_filters
+
         self.typeEmbed = nn.Embedding(types, embed_size)
         self.tableEmbed = nn.Embedding(tables, embed_size)
         
@@ -57,7 +59,7 @@ class FeatureEmbed(nn.Module):
         
         self.linearJoin = nn.Linear(embed_size, embed_size)
         
-        self.linearSample = nn.Linear(1000, embed_size)
+        self.linearSample = nn.Linear(sample_dim, embed_size)
         
         self.linearHist = nn.Linear(bin_number, embed_size)
 
@@ -71,7 +73,7 @@ class FeatureEmbed(nn.Module):
     # input: B by 14 (type, join, f1, f2, f3, mask1, mask2, mask3)
     def forward(self, feature):
 
-        typeId, joinId, filtersId, filtersMask, hists, table_sample = torch.split(feature,(1,1,9,3,self.bin_number*3,1001), dim = -1)
+        typeId, joinId, filtersId, filtersMask, hists, table_sample = torch.split(feature,(1,1,self.max_filters*3,self.max_filters,self.bin_number*self.max_filters,self.sample_dim+1), dim = -1)
         
         typeEmb = self.getType(typeId)
         joinEmb = self.getJoin(joinId)
@@ -94,7 +96,7 @@ class FeatureEmbed(nn.Module):
         return emb.squeeze(1)
     
     def getTable(self, table_sample):
-        table, sample = torch.split(table_sample,(1,1000), dim = -1)
+        table, sample = torch.split(table_sample,(1,self.sample_dim), dim = -1)
         emb = self.tableEmbed(table.long()).squeeze(1)
         
         if self.use_sample:
@@ -108,7 +110,7 @@ class FeatureEmbed(nn.Module):
 
     def getHist(self, hists, filtersMask):
         # batch * 50 * 3
-        histExpand = hists.view(-1,self.bin_number,3).transpose(1,2)
+        histExpand = hists.view(-1, self.max_filters, self.bin_number)
         
         emb = self.linearHist(histExpand)
         emb[~filtersMask.bool()] = 0.  # mask out space holder
@@ -116,13 +118,13 @@ class FeatureEmbed(nn.Module):
         ## avg by # of filters
         num_filters = torch.sum(filtersMask,dim = 1)
         total = torch.sum(emb, dim = 1)
-        avg = total / num_filters.view(-1,1)
+        avg = total / num_filters.view(-1,1).clamp(min=1e-6)
         
         return avg
         
     def getFilter(self, filtersId, filtersMask):
         ## get Filters, then apply mask
-        filterExpand = filtersId.view(-1,3,3).transpose(1,2)
+        filterExpand = filtersId.view(-1,3,self.max_filters).transpose(1,2)
         colsId = filterExpand[:,:,0].long()
         opsId = filterExpand[:,:,1].long()
         vals = filterExpand[:,:,2].unsqueeze(-1) # b by 3 by 1
@@ -156,10 +158,19 @@ class QueryFormer(nn.Module):
     def __init__(self, emb_size = 32 ,ffn_dim = 32, head_size = 8, \
                  dropout = 0.1, attention_dropout_rate = 0.1, n_layers = 8, \
                  use_sample = True, use_hist = True, bin_number = 50, \
-                 pred_hid = 256
+                 pred_hid = 256, sample_dim = 1000, max_filters = 3,
+                 use_join_embedding=0, join_dim=768,
+                 num_tables=10, num_types=20, num_joins=40, num_columns=30, num_ops=4
                 ):
         
         super(QueryFormer,self).__init__()
+
+        self.max_filters = max_filters
+        self.use_join_embedding = use_join_embedding
+        self.join_dim = join_dim
+
+        self.total_feature_len = 2 + (4 + 50) * self.max_filters + 1 + sample_dim
+
         if use_hist:
             hidden_dim = emb_size * 5 + emb_size //8 + 1
         else:
@@ -184,17 +195,24 @@ class QueryFormer(nn.Module):
         self.super_token_virtual_distance = nn.Embedding(1, head_size)
         
         
-        self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number)
-        
-        self.pred = Prediction(hidden_dim, pred_hid)
+        self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number, sample_dim = sample_dim, max_filters = max_filters,
+                                            tables = num_tables, types = num_types, joins = num_joins, columns = num_columns, ops = num_ops)
+
+        mlp_in_dim = hidden_dim
+        if self.use_join_embedding:
+            mlp_in_dim += join_dim
+
+        self.pred = Prediction(mlp_in_dim, pred_hid)
 
         # if multi-task
-        self.pred2 = Prediction(hidden_dim, pred_hid)
+        self.pred2 = Prediction(mlp_in_dim, pred_hid)
         
     def forward(self, batched_data):
         attn_bias, rel_pos, x = batched_data.attn_bias, batched_data.rel_pos, batched_data.x
 
         heights = batched_data.heights     
+
+        join_emb = batched_data.join_emb
         
         n_batch, n_node = x.size()[:2]
         tree_attn_bias = attn_bias.clone()
@@ -210,7 +228,7 @@ class QueryFormer(nn.Module):
         tree_attn_bias[:, :, 1:, 0] = tree_attn_bias[:, :, 1:, 0] + t
         tree_attn_bias[:, :, 0, :] = tree_attn_bias[:, :, 0, :] + t
         
-        x_view = x.view(-1, 1165)
+        x_view = x.view(-1, self.total_feature_len)
         node_feature = self.embbed_layer(x_view).view(n_batch,-1, self.hidden_dim)
         
         # -1 is number of dummy
@@ -224,8 +242,15 @@ class QueryFormer(nn.Module):
         for enc_layer in self.layers:
             output = enc_layer(output, tree_attn_bias)
         output = self.final_ln(output)
+
+        super_node_rep = output[:, 0, :]
+
+        if self.use_join_embedding:
+            final_rep = torch.cat([super_node_rep, join_emb], dim=-1)
+        else:
+            final_rep = super_node_rep
         
-        return self.pred(output[:,0,:]), self.pred2(output[:,0,:])
+        return self.pred(final_rep), self.pred2(final_rep)
 
 
 
@@ -321,26 +346,3 @@ class EncoderLayer(nn.Module):
         y = self.ffn_dropout(y)
         x = x + y
         return x
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

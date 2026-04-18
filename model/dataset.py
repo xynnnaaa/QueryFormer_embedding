@@ -9,11 +9,19 @@ from .database_util import formatFilter, formatJoin, TreeNode, filterDict2Hist
 from .database_util import *
 
 class PlanTreeDataset(Dataset):
-    def __init__(self, json_df : pd.DataFrame, train : pd.DataFrame, encoding, hist_file, card_norm, cost_norm, to_predict, table_sample):
+    def __init__(self, json_df : pd.DataFrame, train : pd.DataFrame, encoding, hist_file, card_norm, cost_norm, to_predict, table_sample, sample_dim=1000, max_filters=3,
+                 use_join_embedding=0, join_embeddings=None, join_dim=768):
 
         self.table_sample = table_sample
         self.encoding = encoding
         self.hist_file = hist_file
+
+        self.sample_dim = sample_dim
+        self.max_filters = max_filters
+
+        self.use_join_embedding = use_join_embedding
+        self.join_embeddings = join_embeddings
+        self.join_dim = join_dim
         
         self.length = len(json_df)
         # train = train.loc[json_df['id']]
@@ -38,11 +46,10 @@ class PlanTreeDataset(Dataset):
         else:
             raise Exception('Unknown to_predict type')
             
-        idxs = list(json_df['id'])
+        self.query_ids = list(json_df['id'])
         
-    
         self.treeNodes = [] ## for mem collection
-        self.collated_dicts = [self.js_node2dict(i,node) for i,node in zip(idxs, nodes)]
+        self.collated_dicts = [self.js_node2dict(i,node) for i,node in zip(self.query_ids, nodes)]
 
     def js_node2dict(self, idx, node):
         treeNode = self.traversePlan(node, idx, self.encoding)
@@ -58,8 +65,22 @@ class PlanTreeDataset(Dataset):
         return self.length
     
     def __getitem__(self, idx):
-        
-        return self.collated_dicts[idx], (self.cost_labels[idx], self.card_labels[idx])
+        query_id = self.query_ids[idx]
+        collated_dict = self.collated_dicts[idx]
+
+        if self.use_join_embedding == 1 and self.join_embeddings is not None:
+            j_emb = self.join_embeddings.get(query_id, np.zeros(self.join_dim, dtype=np.float32))
+        else:
+            j_emb = np.zeros(self.join_dim, dtype=np.float32)
+
+        collated_dict['join_embedding'] = torch.FloatTensor(j_emb)
+
+        if self.to_predict == 'card':
+            # 交换顺序，让 card 变成第一个元素
+            return collated_dict, (self.card_labels[idx], self.cost_labels[idx])
+        else:
+            # 默认 cost 是第一个
+            return collated_dict, (self.cost_labels[idx], self.card_labels[idx])
 
     def old_getitem(self, idx):
         return self.dicts[idx], (self.cost_labels[idx], self.card_labels[idx])
@@ -139,7 +160,10 @@ class PlanTreeDataset(Dataset):
         typeId = encoding.encode_type(nodeType)
         card = None #plan['Actual Rows']
         filters, alias = formatFilter(plan)
-        join = formatJoin(plan)
+        try:
+            join = formatJoin(plan)
+        except KeyError:
+            join = []
         joinId = encoding.encode_join(join)
         filters_encoded = encoding.encode_filters(filters, alias)
         
@@ -152,7 +176,7 @@ class PlanTreeDataset(Dataset):
             root.table_id = encoding.encode_table(plan['Relation Name'])
         root.query_id = idx
         
-        root.feature = node2feature(root, encoding, self.hist_file, self.table_sample)
+        root.feature = node2feature(root, encoding, self.hist_file, self.table_sample, self.sample_dim, self.max_filters)
         #    print(root)
         if 'Plans' in plan:
             for subplan in plan['Plans']:
@@ -187,28 +211,37 @@ class PlanTreeDataset(Dataset):
 
 
 
-def node2feature(node, encoding, hist_file, table_sample):
+def node2feature(node, encoding, hist_file, table_sample, sample_dim=1000, max_filters=3):
     # type, join, filter123, mask123
     # 1, 1, 3x3 (9), 3
     # TODO: add sample (or so-called table)
-    num_filter = len(node.filterDict['colId'])
-    pad = np.zeros((3,3-num_filter))
-    filts = np.array(list(node.filterDict.values())) #cols, ops, vals
+    raw_num_filter = len(node.filterDict['colId'])
+    num_filter = min(raw_num_filter, max_filters)
+
+    pad = np.zeros((3, max_filters-num_filter))
+
+    col_ids = node.filterDict['colId'][:num_filter]
+    op_ids = node.filterDict['opId'][:num_filter]
+    vals = node.filterDict['val'][:num_filter]
+    filts = np.array([col_ids, op_ids, vals])
+
+    # filts = np.array(list(node.filterDict.values())) #cols, ops, vals
     ## 3x3 -> 9, get back with reshape 3,3
     filts = np.concatenate((filts, pad), axis=1).flatten() 
-    mask = np.zeros(3)
+    mask = np.zeros(max_filters)
     mask[:num_filter] = 1
     type_join = np.array([node.typeId, node.join])
     
-    hists = filterDict2Hist(hist_file, node.filterDict, encoding)
+    hists = filterDict2Hist(hist_file, node.filterDict, encoding, max_filters)
 
 
     # table, bitmap, 1 + 1000 bits
     table = np.array([node.table_id])
     if node.table_id == 0:
-        sample = np.zeros(1000)
+        sample = np.zeros(sample_dim)
     else:
-        sample = table_sample[node.query_id][node.table]
+        # sample = table_sample[node.query_id][node.table]
+        sample = table_sample[node.query_id].get(node.table, np.zeros(sample_dim))
     
     #return np.concatenate((type_join,filts,mask))
     return np.concatenate((type_join, filts, mask, hists, table, sample))
