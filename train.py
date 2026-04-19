@@ -194,7 +194,8 @@ def main():
         num_types=len(encoding.type2idx) + 10,
         num_joins=len(encoding.join2idx) + 10,  # Buffer
         num_columns=len(encoding.col2idx) + 10,
-        num_ops=len(encoding.op2idx) + 10
+        num_ops=len(encoding.op2idx) + 10,
+        use_single_embedding=config['use_single_embedding']
     )
     model = model.to(args.device)
 

@@ -35,7 +35,7 @@ class Prediction(nn.Module):
         
 class FeatureEmbed(nn.Module):
     def __init__(self, embed_size=32, tables = 10, types=20, joins = 40, columns= 30, \
-                 ops=4, use_sample = True, use_hist = True, bin_number = 50, sample_dim = 1000, max_filters = 3):
+                 ops=4, use_sample = True, use_hist = True, bin_number = 50, sample_dim = 1000, max_filters = 3, use_single_embedding=0):
         super(FeatureEmbed, self).__init__()
         
         self.use_sample = use_sample
@@ -45,6 +45,8 @@ class FeatureEmbed(nn.Module):
         self.bin_number = bin_number
         self.sample_dim = sample_dim
         self.max_filters = max_filters
+
+        self.use_single_embedding = use_single_embedding
 
         self.typeEmbed = nn.Embedding(types, embed_size)
         self.tableEmbed = nn.Embedding(tables, embed_size)
@@ -59,11 +61,22 @@ class FeatureEmbed(nn.Module):
         
         self.linearJoin = nn.Linear(embed_size, embed_size)
         
-        self.linearSample = nn.Linear(sample_dim, embed_size)
+        # self.linearSample = nn.Linear(sample_dim, embed_size)
         
         self.linearHist = nn.Linear(bin_number, embed_size)
 
         self.joinEmbed = nn.Embedding(joins, embed_size)
+
+        if self.use_single_embedding == 1:
+            # 新增：为单表 Embedding 准备的单层 MLP (带激活函数)
+            # 将高维稠密特征降维对齐到 embed_size
+            self.single_emb_mlp = nn.Sequential(
+                nn.Linear(sample_dim, embed_size),
+                nn.LeakyReLU()
+            )
+        else:
+            # 原版逻辑：Bitmap 的线性映射 (不带激活函数，兼容原版)
+            self.linearSample = nn.Linear(sample_dim, embed_size)
         
         if use_hist:
             self.project = nn.Linear(embed_size*5 + embed_size//8+1, embed_size*5 + embed_size//8+1)
@@ -100,7 +113,12 @@ class FeatureEmbed(nn.Module):
         emb = self.tableEmbed(table.long()).squeeze(1)
         
         if self.use_sample:
-            emb += self.linearSample(sample)
+            if self.use_single_embedding == 1:
+                # 新增逻辑：经过专属 MLP 处理
+                emb += self.single_emb_mlp(sample)
+            else:
+                # 回退逻辑：原版的线性层
+                emb += self.linearSample(sample)
         return emb
     
     def getJoin(self, joinId):
@@ -160,7 +178,8 @@ class QueryFormer(nn.Module):
                  use_sample = True, use_hist = True, bin_number = 50, \
                  pred_hid = 256, sample_dim = 1000, max_filters = 3,
                  use_join_embedding=0, join_dim=768,
-                 num_tables=10, num_types=20, num_joins=40, num_columns=30, num_ops=4
+                 num_tables=10, num_types=20, num_joins=40, num_columns=30, num_ops=4,
+                 use_single_embedding=0
                 ):
         
         super(QueryFormer,self).__init__()
@@ -196,11 +215,19 @@ class QueryFormer(nn.Module):
         
         
         self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number, sample_dim = sample_dim, max_filters = max_filters,
-                                            tables = num_tables, types = num_types, joins = num_joins, columns = num_columns, ops = num_ops)
+                                            tables = num_tables, types = num_types, joins = num_joins, columns = num_columns, ops = num_ops, use_single_embedding=use_single_embedding)
 
         mlp_in_dim = hidden_dim
         if self.use_join_embedding:
-            mlp_in_dim += join_dim
+            # mlp_in_dim += join_dim
+            # 新增：将 768 维的 Join Embedding 映射到一个与 Super Node 匹配的维度（比如 hidden_dim）
+            # 这样做既能提取高级特征，又能防止拼接后维度过大导致后续参数爆炸
+            self.join_emb_mlp = nn.Sequential(
+                nn.Linear(join_dim, hidden_dim),
+                nn.LeakyReLU()
+            )
+            # 拼接后的输入维度 = Super Node 维度 + MLP 映射后的维度
+            mlp_in_dim += hidden_dim 
 
         self.pred = Prediction(mlp_in_dim, pred_hid)
 
@@ -246,14 +273,13 @@ class QueryFormer(nn.Module):
         super_node_rep = output[:, 0, :]
 
         if self.use_join_embedding:
-            final_rep = torch.cat([super_node_rep, join_emb], dim=-1)
+            # 1. 经过专属 MLP 处理
+            processed_join_emb = self.join_emb_mlp(join_emb)
+            final_rep = torch.cat([super_node_rep, processed_join_emb], dim=-1)
         else:
             final_rep = super_node_rep
         
         return self.pred(final_rep), self.pred2(final_rep)
-
-
-
 
 
 class FeedForwardNetwork(nn.Module):

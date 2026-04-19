@@ -1,23 +1,43 @@
 #!/bin/bash
 
-# 学习率列表
-lrs=(0.001 0.002 0.0005 0.0002)
+# ===== 设置要训练的数据集 =====
+# 可选值：imdb, ergastf1, genome, 等
+dataset="stats"
 
-# 固定路径和配置
-CONFIG_FILE="/home/vipuser/QueryFormer/data/imdb/config-single.json"
-LOG_DIR="/home/vipuser/QueryFormer/data/imdb/runfile"
+# ===== 固定配置 =====
+BASE_DIR="/home/vipuser/QueryFormer/data/${dataset}"
+CONFIG_DIR="${BASE_DIR}"          # 假设配置文件也放在同一目录下
+LOG_DIR="${BASE_DIR}/runfile"
 mkdir -p ${LOG_DIR}
 
-for lr in ${lrs[@]}; do
+# 配置文件及其对应的日志文件名（去掉 .json 后缀）
+configs=(
+    "default"
+    "single"
+    "join"
+)
+
+# 使用的 GPU 设备
+CUDA_DEVICE=1
+
+echo "=========================================="
+echo "Starting sequential training for dataset: ${dataset}"
+echo "Log directory: ${LOG_DIR}"
+echo "=========================================="
+
+for cfg in ${configs[@]}; do
+    CONFIG_FILE="${CONFIG_DIR}/config-${cfg}.json"
+    LOG_FILE="${LOG_DIR}/${cfg}.log"
+
     echo "=========================================="
-    echo "Starting experiment with lr = ${lr}"
-    echo "Log: ${LOG_DIR}/single-${lr}.log"
+    echo "Running with config: ${CONFIG_FILE}"
+    echo "Log: ${LOG_FILE}"
     echo "=========================================="
 
-    CUDA_VISIBLE_DEVICES=1 python3 -u train.py ${CONFIG_FILE} --lr ${lr} > ${LOG_DIR}/single-${lr}.log 2>&1
+    CUDA_VISIBLE_DEVICES=${CUDA_DEVICE} python3 -u train.py ${CONFIG_FILE} > ${LOG_FILE} 2>&1
 
-    echo "Finished experiment with lr = ${lr}"
+    echo "Finished: ${cfg}"
     echo ""
 done
 
-echo "All experiments completed."
+echo "All experiments completed for dataset: ${dataset}"
