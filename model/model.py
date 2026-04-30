@@ -220,6 +220,7 @@ class QueryFormer(nn.Module):
         mlp_in_dim = hidden_dim
         if self.use_join_embedding:
             # mlp_in_dim += join_dim
+
             # 新增：将 768 维的 Join Embedding 映射到一个与 Super Node 匹配的维度（比如 hidden_dim）
             # 这样做既能提取高级特征，又能防止拼接后维度过大导致后续参数爆炸
             self.join_emb_mlp = nn.Sequential(
@@ -273,6 +274,8 @@ class QueryFormer(nn.Module):
         super_node_rep = output[:, 0, :]
 
         if self.use_join_embedding:
+            # final_rep = torch.cat([super_node_rep, join_emb], dim=-1)
+
             # 1. 经过专属 MLP 处理
             processed_join_emb = self.join_emb_mlp(join_emb)
             final_rep = torch.cat([super_node_rep, processed_join_emb], dim=-1)

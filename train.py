@@ -82,6 +82,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('config_file', help='Path to config JSON file')
     parser.add_argument('--lr', type=float, default=None, help='Learning rate (overrides Args.lr)')
+    parser.add_argument('--use_sample', type=lambda x: x.lower() == 'true', default=True,
+                        help='Use sample in QueryFormer (default: True)')
+    parser.add_argument('--bs', type=int, default=None, help='Learning rate (overrides Args.bs)')
+
     args_parse = parser.parse_args()
     config_file = args_parse.config_file
 
@@ -89,6 +93,8 @@ def main():
     args = Args()
     if args_parse.lr is not None:
         args.lr = args_parse.lr
+    if args_parse.bs is not None:
+        args.bs = args_parse.bs
 
     # 输出必要的配置信息
     print("Training Configuration:")
@@ -106,6 +112,7 @@ def main():
     print(f"Device: {args.device}")
     print(f"New Path: {args.newpath}")
     print(f"To Predict: {args.to_predict}")
+    print(f"Use sample: {args_parse.use_sample}")
 
 
     timestamp = datetime.datetime.now().strftime("%m%d_%H%M%S")
@@ -183,7 +190,7 @@ def main():
         head_size=args.head_size,
         dropout=args.dropout,
         n_layers=args.n_layers,
-        use_sample=True,
+        use_sample=args_parse.use_sample,
         use_hist=True,
         pred_hid=args.pred_hid,
         sample_dim=config['sample_dim'],
