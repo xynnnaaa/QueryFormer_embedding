@@ -225,7 +225,11 @@ class QueryFormer(nn.Module):
             # 这样做既能提取高级特征，又能防止拼接后维度过大导致后续参数爆炸
             self.join_emb_mlp = nn.Sequential(
                 nn.Linear(join_dim, hidden_dim),
-                nn.LeakyReLU()
+                nn.LeakyReLU(),
+
+                # add
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(dropout)
             )
             # 拼接后的输入维度 = Super Node 维度 + MLP 映射后的维度
             mlp_in_dim += hidden_dim 

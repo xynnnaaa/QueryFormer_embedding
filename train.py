@@ -36,7 +36,7 @@ class Args:
     sch_decay = 0.6
     device = 'cuda:0'
     # newpath = './results/full/card/'
-    newpath = '/data/QueryFormer/results/full/card/'
+    newpath = '/data2/QueryFormer/results/full/card/'
     to_predict = 'card'
 
 
