@@ -84,37 +84,38 @@ class FeatureEmbed(nn.Module):
             # Mode 1: 纯 Embedding
             print(f"[FeatureEmbed] Using Mode 1: Pure Embedding. Embedding Dim: {self.emb_dim}, Projected to: {self.embed_size}.")
             self.emb_norm = nn.LayerNorm(self.emb_dim)
-            self.emb_proj = nn.Linear(self.emb_dim, self.embed_size)
+
             if self.use_log_count == 1:
                 self.cnt_proj = nn.Linear(1, self.embed_size)
                 print(f"[FeatureEmbed] Log Count is enabled. Count projected to: {self.embed_size}.")
 
             if self.has_pca:
-                self.pca_proj = nn.Linear(self.pca_dim, self.embed_size)
-                self.fusion_mlp_no_bitmap = nn.Linear(self.embed_size * 2, self.embed_size)
-                print(f"[FeatureEmbed] PCA is enabled. PCA Dim: {self.pca_dim}, Projected to: {self.embed_size}. Fusion MLP combines Embedding and PCA.")
+                # 给 PCA 单独降维到 emb_dim (比如 1536 -> 768)
+                self.pca_proj = nn.Linear(self.pca_dim, self.emb_dim)
+                # 融合 MLP: 输入是 Emb(768) + Proj_PCA(768)
+                self.fusion_mlp_no_bitmap = nn.Linear(self.emb_dim * 2, self.embed_size)
+                print(f"[FeatureEmbed] PCA is enabled. PCA mapped to {self.emb_dim}. Fusion MLP combines Emb and Proj_PCA.")
+            else:
+                # 如果没有 PCA，则直接将 Embedding 映射到 embed_size
+                self.emb_proj = nn.Linear(self.emb_dim, self.embed_size)
 
             self.single_emb_drop = nn.Dropout(p=dropout)
 
         elif self.use_single_embedding == 2:
             # Mode 2: Bitmap + Embedding 拼接
-            print(f"[FeatureEmbed] Using Mode 2: Bitmap + Embedding. Bitmap Dim: {self.bitmap_dim}, Embedding Dim: {self.emb_dim}, Projected to: {self.embed_size}.")
+            print(f"[FeatureEmbed] Using Mode 2: Bitmap + Embedding. Bitmap Dim: {self.bitmap_dim}, Embedding Dim: {self.emb_dim}.")
             self.emb_norm = nn.LayerNorm(self.emb_dim)
-            self.emb_proj = nn.Linear(self.emb_dim, self.embed_size)
+
             if self.use_log_count == 1:
                 print(f"[FeatureEmbed] Log Count is enabled. Count projected to: {self.embed_size}.")
                 self.cnt_proj = nn.Linear(1, self.embed_size)
-            # 【新增】：应对 Bitmap + Embedding + PCA 的情况
-            # 分离提纯通道
-            self.bitmap_proj = nn.Linear(self.bitmap_dim, self.embed_size)
-
 
             if self.has_pca:
-                self.pca_proj = nn.Linear(self.pca_dim, self.embed_size)
-                self.fusion_mlp_3way = nn.Linear(self.embed_size * 3, self.embed_size)
-                print(f"[FeatureEmbed] PCA is enabled. PCA Dim: {self.pca_dim}, Projected to: {self.embed_size}. Fusion MLP combines Bitmap, Embedding, and PCA.")
+                self.pca_proj = nn.Linear(self.pca_dim, self.emb_dim)
+                self.fusion_mlp_3way = nn.Linear(self.bitmap_dim + self.emb_dim * 2, self.embed_size)
+                print(f"[FeatureEmbed] PCA is enabled. PCA mapped to {self.emb_dim}. Fusion MLP combines Bitmap, Emb, and Proj_PCA.")
             else:
-                self.fusion_mlp_2way = nn.Linear(self.embed_size * 2, self.embed_size)
+                self.fusion_mlp_2way = nn.Linear(self.bitmap_dim + self.emb_dim, self.embed_size)
 
             self.single_emb_drop = nn.Dropout(p=dropout)
 
@@ -163,17 +164,16 @@ class FeatureEmbed(nn.Module):
             elif self.use_single_embedding == 1:
 
                 s_emb = sample[:, :self.emb_dim]
-                s_emb_norm = self.emb_proj(self.emb_norm(s_emb))
+                s_emb = self.emb_norm(s_emb)
 
                 if self.has_pca:
                     # 切出 PCA 并降维
                     s_pca = sample[:, -self.pca_dim:]
-                    s_pca_proj = self.pca_proj(s_pca)
-                    # 融合 Emb 和 PCA
-                    s_fusion = torch.cat([s_emb_norm, s_pca_proj], dim=-1)
+                    proj_pca = self.pca_proj(s_pca) # 降维到 emb_dim (768)
+                    s_fusion = torch.cat([s_emb_norm, proj_pca], dim=-1)
                     final_feat = self.fusion_mlp_no_bitmap(s_fusion)
                 else:
-                    final_feat = s_emb_norm
+                    final_feat = self.emb_proj(s_emb)
 
                 if self.use_log_count == 1:
                     s_cnt = sample[:, self.emb_dim:self.emb_dim+1]
@@ -186,26 +186,23 @@ class FeatureEmbed(nn.Module):
                 s_bitmap = sample[:, :self.bitmap_dim]
                 s_emb_raw = sample[:, self.bitmap_dim:]
                 
-                # 1. 提纯 Bitmap
-                proj_bitmap = self.bitmap_proj(s_bitmap)
-                
-                # 2. 提纯 Embedding
+                # 提纯 Embedding
                 s_emb = s_emb_raw[:, :self.emb_dim]
-                proj_emb = self.emb_proj(self.emb_norm(s_emb))
+                s_emb = self.emb_norm(s_emb)
                 
-                # 3. 组合并融合
+                # 组合并融合
                 if self.has_pca:
                     s_pca = sample[:, -self.pca_dim:]
                     proj_pca = self.pca_proj(s_pca)
-                    # 三股力量合并：[64, 64, 64] -> 192 -> 融合到 64
-                    s_fusion = torch.cat([proj_bitmap, proj_emb, proj_pca], dim=-1)
+                    
+                    s_fusion = torch.cat([s_bitmap, s_emb, proj_pca], dim=-1) # [1000, 768, 768]
                     final_feat = self.fusion_mlp_3way(s_fusion)
+
                 else:
-                    # 兼容旧逻辑：[64, 64] -> 128 -> 融合到 64
-                    s_fusion = torch.cat([proj_bitmap, proj_emb], dim=-1)
+                    s_fusion = torch.cat([s_bitmap, s_emb], dim=-1) # [1000, 768]
                     final_feat = self.fusion_mlp_2way(s_fusion)
                     
-                # 4. 加入绝对锚点 log_count
+                # 4. 加入 log_count
                 if self.use_log_count == 1:
                     s_cnt = s_emb_raw[:, self.emb_dim:self.emb_dim+1]
                     emb = emb + self.single_emb_drop(final_feat) + self.cnt_proj(s_cnt)

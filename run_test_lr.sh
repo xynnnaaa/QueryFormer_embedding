@@ -33,7 +33,7 @@ for config in ${configs[@]}; do
             echo "Log = ${LOG_DIR}/lr${lr}-bs${bs}.log"
             echo "=========================================="
 
-            CUDA_VISIBLE_DEVICES=1 python3 -u train.py ${CONFIG_FILE} --lr ${lr} --bs ${bs} \
+            CUDA_VISIBLE_DEVICES=0 python3 -u train.py ${CONFIG_FILE} --lr ${lr} --bs ${bs} \
             > ${LOG_DIR}/lr${lr}-bs${bs}.log 2>&1
 
             echo "Finished experiment:"
