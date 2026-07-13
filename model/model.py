@@ -35,7 +35,8 @@ class Prediction(nn.Module):
         
 class FeatureEmbed(nn.Module):
     def __init__(self, embed_size=32, tables = 10, types=20, joins = 40, columns= 30, \
-                 ops=4, use_sample = True, use_hist = True, bin_number = 50, sample_dim = 1000, max_filters = 3, use_single_embedding=0):
+                 ops=4, use_sample = True, use_hist = True, bin_number = 50, sample_dim = 1000, max_filters = 3, use_single_embedding=0, dropout=0.1,
+                use_log_count=0, emb_dim=768, bitmap_dim=1000, has_pca=False):
         super(FeatureEmbed, self).__init__()
         
         self.use_sample = use_sample
@@ -43,10 +44,18 @@ class FeatureEmbed(nn.Module):
         
         self.use_hist = use_hist
         self.bin_number = bin_number
-        self.sample_dim = sample_dim
+        self.sample_dim = sample_dim # 计算好的total_sample_dim
         self.max_filters = max_filters
 
+        self.use_log_count = use_log_count
+        self.emb_dim = emb_dim
+        self.bitmap_dim = bitmap_dim
+
         self.use_single_embedding = use_single_embedding
+
+        # 预设的 PCA 维度
+        self.pca_dim = 768 * 2
+        self.has_pca = has_pca
 
         self.typeEmbed = nn.Embedding(types, embed_size)
         self.tableEmbed = nn.Embedding(tables, embed_size)
@@ -67,22 +76,57 @@ class FeatureEmbed(nn.Module):
 
         self.joinEmbed = nn.Embedding(joins, embed_size)
 
-        if self.use_single_embedding == 1:
-            # 新增：为单表 Embedding 准备的单层 MLP (带激活函数)
-            # 将高维稠密特征降维对齐到 embed_size
-            self.single_emb_mlp = nn.Sequential(
-                nn.Linear(sample_dim, embed_size),
-                nn.LeakyReLU()
-            )
+        if self.use_single_embedding == 0:
+            # Mode 0: 纯 Bitmap
+            self.linearSample = nn.Linear(self.sample_dim, embed_size)
+            print(f"[FeatureEmbed] Using Mode 0: Pure Bitmap. LinearSample maps {self.sample_dim} to {embed_size}.")
+        elif self.use_single_embedding == 1:
+            # Mode 1: 纯 Embedding
+            print(f"[FeatureEmbed] Using Mode 1: Pure Embedding. Embedding Dim: {self.emb_dim}, Projected to: {self.embed_size}.")
+            self.emb_norm = nn.LayerNorm(self.emb_dim)
+            self.emb_proj = nn.Linear(self.emb_dim, self.embed_size)
+            if self.use_log_count == 1:
+                self.cnt_proj = nn.Linear(1, self.embed_size)
+                print(f"[FeatureEmbed] Log Count is enabled. Count projected to: {self.embed_size}.")
+
+            if self.has_pca:
+                self.pca_proj = nn.Linear(self.pca_dim, self.embed_size)
+                self.fusion_mlp_no_bitmap = nn.Linear(self.embed_size * 2, self.embed_size)
+                print(f"[FeatureEmbed] PCA is enabled. PCA Dim: {self.pca_dim}, Projected to: {self.embed_size}. Fusion MLP combines Embedding and PCA.")
+
+            self.single_emb_drop = nn.Dropout(p=dropout)
+
+        elif self.use_single_embedding == 2:
+            # Mode 2: Bitmap + Embedding 拼接
+            print(f"[FeatureEmbed] Using Mode 2: Bitmap + Embedding. Bitmap Dim: {self.bitmap_dim}, Embedding Dim: {self.emb_dim}, Projected to: {self.embed_size}.")
+            self.emb_norm = nn.LayerNorm(self.emb_dim)
+            self.emb_proj = nn.Linear(self.emb_dim, self.embed_size)
+            if self.use_log_count == 1:
+                print(f"[FeatureEmbed] Log Count is enabled. Count projected to: {self.embed_size}.")
+                self.cnt_proj = nn.Linear(1, self.embed_size)
+            # 【新增】：应对 Bitmap + Embedding + PCA 的情况
+            # 分离提纯通道
+            self.bitmap_proj = nn.Linear(self.bitmap_dim, self.embed_size)
+
+
+            if self.has_pca:
+                self.pca_proj = nn.Linear(self.pca_dim, self.embed_size)
+                self.fusion_mlp_3way = nn.Linear(self.embed_size * 3, self.embed_size)
+                print(f"[FeatureEmbed] PCA is enabled. PCA Dim: {self.pca_dim}, Projected to: {self.embed_size}. Fusion MLP combines Bitmap, Embedding, and PCA.")
+            else:
+                self.fusion_mlp_2way = nn.Linear(self.embed_size * 2, self.embed_size)
+
+            self.single_emb_drop = nn.Dropout(p=dropout)
+
         else:
             # 原版逻辑：Bitmap 的线性映射 (不带激活函数，兼容原版)
-            self.linearSample = nn.Linear(sample_dim, embed_size)
-        
-        if use_hist:
-            self.project = nn.Linear(embed_size*5 + embed_size//8+1, embed_size*5 + embed_size//8+1)
+            self.linearSample = nn.Linear(self.sample_dim, self.embed_size)
+
+        if self.use_hist:
+            self.project = nn.Linear(self.embed_size*5 + self.embed_size//8+1, self.embed_size*5 + self.embed_size//8+1)
         else:
-            self.project = nn.Linear(embed_size*4 + embed_size//8+1, embed_size*4 + embed_size//8+1)
-    
+            self.project = nn.Linear(self.embed_size*4 + self.embed_size//8+1, self.embed_size*4 + self.embed_size//8+1)
+
     # input: B by 14 (type, join, f1, f2, f3, mask1, mask2, mask3)
     def forward(self, feature):
 
@@ -113,12 +157,60 @@ class FeatureEmbed(nn.Module):
         emb = self.tableEmbed(table.long()).squeeze(1)
         
         if self.use_sample:
-            if self.use_single_embedding == 1:
-                # 新增逻辑：经过专属 MLP 处理
-                emb += self.single_emb_mlp(sample)
-            else:
-                # 回退逻辑：原版的线性层
-                emb += self.linearSample(sample)
+            if self.use_single_embedding == 0:
+                # Mode 0
+                emb = emb + self.linearSample(sample)
+            elif self.use_single_embedding == 1:
+
+                s_emb = sample[:, :self.emb_dim]
+                s_emb_norm = self.emb_proj(self.emb_norm(s_emb))
+
+                if self.has_pca:
+                    # 切出 PCA 并降维
+                    s_pca = sample[:, -self.pca_dim:]
+                    s_pca_proj = self.pca_proj(s_pca)
+                    # 融合 Emb 和 PCA
+                    s_fusion = torch.cat([s_emb_norm, s_pca_proj], dim=-1)
+                    final_feat = self.fusion_mlp_no_bitmap(s_fusion)
+                else:
+                    final_feat = s_emb_norm
+
+                if self.use_log_count == 1:
+                    s_cnt = sample[:, self.emb_dim:self.emb_dim+1]
+                    s_cnt = self.cnt_proj(s_cnt)
+                    emb = emb + self.single_emb_drop(final_feat) + s_cnt
+                else:
+                    emb = emb + self.single_emb_drop(final_feat)
+
+            elif self.use_single_embedding == 2:
+                s_bitmap = sample[:, :self.bitmap_dim]
+                s_emb_raw = sample[:, self.bitmap_dim:]
+                
+                # 1. 提纯 Bitmap
+                proj_bitmap = self.bitmap_proj(s_bitmap)
+                
+                # 2. 提纯 Embedding
+                s_emb = s_emb_raw[:, :self.emb_dim]
+                proj_emb = self.emb_proj(self.emb_norm(s_emb))
+                
+                # 3. 组合并融合
+                if self.has_pca:
+                    s_pca = sample[:, -self.pca_dim:]
+                    proj_pca = self.pca_proj(s_pca)
+                    # 三股力量合并：[64, 64, 64] -> 192 -> 融合到 64
+                    s_fusion = torch.cat([proj_bitmap, proj_emb, proj_pca], dim=-1)
+                    final_feat = self.fusion_mlp_3way(s_fusion)
+                else:
+                    # 兼容旧逻辑：[64, 64] -> 128 -> 融合到 64
+                    s_fusion = torch.cat([proj_bitmap, proj_emb], dim=-1)
+                    final_feat = self.fusion_mlp_2way(s_fusion)
+                    
+                # 4. 加入绝对锚点 log_count
+                if self.use_log_count == 1:
+                    s_cnt = s_emb_raw[:, self.emb_dim:self.emb_dim+1]
+                    emb = emb + self.single_emb_drop(final_feat) + self.cnt_proj(s_cnt)
+                else:
+                    emb = emb + self.single_emb_drop(final_feat)
         return emb
     
     def getJoin(self, joinId):
@@ -179,7 +271,8 @@ class QueryFormer(nn.Module):
                  pred_hid = 256, sample_dim = 1000, max_filters = 3,
                  use_join_embedding=0, join_dim=768,
                  num_tables=10, num_types=20, num_joins=40, num_columns=30, num_ops=4,
-                 use_single_embedding=0
+                 use_single_embedding=0, join_proj_dim=64, # 【新增参数】：join embedding 映射后的维度，默认为 64
+                 use_log_count=0, emb_dim=768, bitmap_dim=1000, has_pca=False
                 ):
         
         super(QueryFormer,self).__init__()
@@ -187,6 +280,8 @@ class QueryFormer(nn.Module):
         self.max_filters = max_filters
         self.use_join_embedding = use_join_embedding
         self.join_dim = join_dim
+
+        self.join_proj_dim = join_proj_dim
 
         self.total_feature_len = 2 + (4 + 50) * self.max_filters + 1 + sample_dim
 
@@ -215,24 +310,58 @@ class QueryFormer(nn.Module):
         
         
         self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number, sample_dim = sample_dim, max_filters = max_filters,
-                                            tables = num_tables, types = num_types, joins = num_joins, columns = num_columns, ops = num_ops, use_single_embedding=use_single_embedding)
+                                            tables = num_tables, types = num_types, joins = num_joins, columns = num_columns, ops = num_ops, use_single_embedding=use_single_embedding,
+                                            use_log_count=use_log_count, emb_dim=emb_dim, bitmap_dim=bitmap_dim, dropout=dropout, has_pca=has_pca)
 
         mlp_in_dim = hidden_dim
         if self.use_join_embedding:
-            # mlp_in_dim += join_dim
 
-            # 新增：将 768 维的 Join Embedding 映射到一个与 Super Node 匹配的维度（比如 hidden_dim）
-            # 这样做既能提取高级特征，又能防止拼接后维度过大导致后续参数爆炸
+            # print(f"[Initialized join_emb_mlp] with input dim {join_dim} and output dim {self.join_proj_dim}")
+            # # mlp_in_dim += join_dim
+
+            # # 新增：将 768 维的 Join Embedding 映射到一个与 Super Node 匹配的维度（比如 hidden_dim）
+            # # 这样做既能提取高级特征，又能防止拼接后维度过大导致后续参数爆炸
+            # self.join_emb_mlp = nn.Sequential(
+
+            #     # join v1
+            #     # nn.Linear(join_dim, hidden_dim),
+            #     # nn.LeakyReLU()
+
+            #     # join v2 add layer norm and dropout
+            #     # nn.Linear(join_dim, hidden_dim),
+            #     # nn.LeakyReLU(),
+            #     # nn.LayerNorm(hidden_dim),
+            #     # nn.Dropout(dropout)
+
+            #     # join v3
+            #     # nn.Linear(join_dim, hidden_dim),
+            #     # nn.Dropout(dropout)
+
+            #     # join v4
+            #     nn.Linear(join_dim, self.join_proj_dim),
+            #     nn.Dropout(dropout)
+
+            #     # # join v5
+            #     # nn.LayerNorm(join_dim),
+            #     # nn.Linear(join_dim, self.join_proj_dim),
+            #     # nn.LeakyReLU(negative_slope=0.01),
+            #     # nn.Dropout(dropout)
+            # )
+            # # 拼接后的输入维度 = Super Node 维度 + MLP 映射后的维度
+            # mlp_in_dim += self.join_proj_dim 
+
+
+            # join v6
+
+            print(f"[Initialized join_emb_mlp] with input dim {join_dim} and output dim {hidden_dim}")
+            
+            # 映射维度直接对齐 hidden_dim 
             self.join_emb_mlp = nn.Sequential(
+                nn.LayerNorm(join_dim), # 规范化外部特征
                 nn.Linear(join_dim, hidden_dim),
-                nn.LeakyReLU(),
-
-                # add
-                nn.LayerNorm(hidden_dim),
+                nn.LeakyReLU(negative_slope=0.01),
                 nn.Dropout(dropout)
             )
-            # 拼接后的输入维度 = Super Node 维度 + MLP 映射后的维度
-            mlp_in_dim += hidden_dim 
 
         self.pred = Prediction(mlp_in_dim, pred_hid)
 
@@ -267,6 +396,12 @@ class QueryFormer(nn.Module):
         
         node_feature = node_feature + self.height_encoder(heights)
         super_token_feature = self.super_token.weight.unsqueeze(0).repeat(n_batch, 1, 1)
+
+        # join v6
+        if self.use_join_embedding:
+            processed_join_emb = self.join_emb_mlp(join_emb).unsqueeze(1)
+            super_token_feature = super_token_feature + processed_join_emb
+
         super_node_feature = torch.cat([super_token_feature, node_feature], dim=1)        
         
         # transfomrer encoder
@@ -277,16 +412,18 @@ class QueryFormer(nn.Module):
 
         super_node_rep = output[:, 0, :]
 
-        if self.use_join_embedding:
-            # final_rep = torch.cat([super_node_rep, join_emb], dim=-1)
+        # if self.use_join_embedding:
+        #     # final_rep = torch.cat([super_node_rep, join_emb], dim=-1)
 
-            # 1. 经过专属 MLP 处理
-            processed_join_emb = self.join_emb_mlp(join_emb)
-            final_rep = torch.cat([super_node_rep, processed_join_emb], dim=-1)
-        else:
-            final_rep = super_node_rep
+        #     # 1. 经过专属 MLP 处理
+        #     processed_join_emb = self.join_emb_mlp(join_emb)
+        #     final_rep = torch.cat([super_node_rep, processed_join_emb], dim=-1)
+        # else:
+        #     final_rep = super_node_rep
         
-        return self.pred(final_rep), self.pred2(final_rep)
+        # return self.pred(final_rep), self.pred2(final_rep)
+
+        return self.pred(super_node_rep), self.pred2(super_node_rep)
 
 
 class FeedForwardNetwork(nn.Module):

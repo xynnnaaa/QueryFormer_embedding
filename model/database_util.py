@@ -63,11 +63,10 @@ def floyd_warshall_rewrite(adjacency_matrix):
                 M[i][j] = min(M[i][j], M[i][k]+M[k][j])
     return M
 
-def get_job_table_sample(workload_file_name, num_materialized_samples = 1000, use_single_embedding=0, embedding_file=None):
+def get_job_table_sample(workload_file_name, num_materialized_samples = 1000, use_single_embedding=0, embedding_file=None,
+                        single_emb_dim=768): # 这里的 single_emb_dim 接收的是 valid_single_emb_dim
 
     tables = []
-    samples = []
-
     tables_info = [] # 存储每条查询的表信息 [(table_name, alias), ...]
 
     # Load queries
@@ -91,28 +90,12 @@ def get_job_table_sample(workload_file_name, num_materialized_samples = 1000, us
 
     print("Loaded queries with len ", len(tables))
 
-    if use_single_embedding == 1:
-        if embedding_file and os.path.exists(embedding_file):
-            raw_data = torch.load(embedding_file) # { seq_id: {alias: tensor} }
-            table_sample = []
-            for query_id, table_info in enumerate(tables_info):
-                sample_dict = {}
-                for table_name, alias in table_info:
-                    if alias in raw_data[query_id]:
-                        sample_dict[table_name] = raw_data[query_id][alias].numpy() if torch.is_tensor(raw_data[query_id][alias]) else raw_data[query_id][alias]
-                    else:
-                        print(f"Alias {alias} not found in embedding file for query {query_id}")
-                        sample_dict[table_name] = torch.zeros(768)  # Assuming embedding size is 768
-                table_sample.append(sample_dict)
-
-            print(f"Loaded single embedding samples from {embedding_file}")
-        else:
-            print(f"Embedding file {embedding_file} not found. Please provide a valid embedding file.")
-            exit(1)
-    else:
-        # Load bitmaps
+    def load_bitmaps():
+        samples = []
         num_bytes_per_bitmap = int((num_materialized_samples + 7) >> 3)
-        with open(workload_file_name + ".bitmaps", 'rb') as f:
+        bitmap_file_name = workload_file_name + "-qa.bitmaps"
+        with open(bitmap_file_name, 'rb') as f:
+            print(f"Loaded sample bitmap from {bitmap_file_name}.")
             for i in range(len(tables)):
                 four_bytes = f.read(4)
                 if not four_bytes:
@@ -128,14 +111,72 @@ def get_job_table_sample(workload_file_name, num_materialized_samples = 1000, us
                         exit(1)
                     bitmaps[j] = np.unpackbits(np.frombuffer(bitmap_bytes, dtype=np.uint8))
                 samples.append(bitmaps)
-        print("Loaded bitmaps")
-        table_sample = []
+        bitmap_dict_list = []
         for ts, ss in zip(tables,samples):
             d = {}
             for t, s in zip(ts,ss):
                 tf = t.split(' ')[0] # remove alias
                 d[tf] = s
-            table_sample.append(d)
+            bitmap_dict_list.append(d)
+            
+        return bitmap_dict_list
+
+    def load_embeddings():
+        if not embedding_file or not os.path.exists(embedding_file):
+            print(f"Error: Embedding file {embedding_file} not found.")
+            exit(1)
+
+        raw_data = torch.load(embedding_file)
+        emb_dict_list = []
+
+        base_emb_dim = 768
+        has_log = (single_emb_dim % 768 == 1) # 简单反推是否有 log
+        has_pca = (single_emb_dim > 1000)     # 简单反推是否有 pca
+
+        for query_id, table_info in enumerate(tables_info):
+            sample_dict = {}
+            for table_name, alias in table_info:
+                if alias in raw_data[query_id]:
+                    vec = raw_data[query_id][alias]
+                    vec_np = vec.numpy() if torch.is_tensor(vec) else vec
+
+                    final_vec = vec_np[:base_emb_dim].copy()
+                    if has_log == 1:
+                        # count 永远在第 768 位
+                        cnt_val = vec_np[base_emb_dim:base_emb_dim+1]
+                        final_vec = np.concatenate([final_vec, cnt_val])
+                    if has_pca:
+                        # PCA 永远在最后 1536 维
+                        pca_val = vec_np[-1536:]
+                        final_vec = np.concatenate([final_vec, pca_val])
+                    sample_dict[table_name] = final_vec
+                else:
+                    print(f"Alias {alias} not found in embedding file for query {query_id}")
+                    sample_dict[table_name] = np.zeros(single_emb_dim)  # Assuming embedding size is single_emb_dim
+            emb_dict_list.append(sample_dict)
+
+        print(f"Loaded embeddings from {embedding_file}")
+        
+        return emb_dict_list
+
+    if use_single_embedding == 0:
+        return load_bitmaps()
+    elif use_single_embedding == 1:
+        return load_embeddings()
+    elif use_single_embedding == 2:
+        # 【新增】：模式 2，加载两者并按表名拼接
+        bitmaps = load_bitmaps()
+        embs = load_embeddings()
+        combined_sample = []
+        for i in range(len(tables_info)):
+            d = {}
+            for table_name, _ in tables_info[i]:
+                bitmap = bitmaps[i].get(table_name, np.zeros(num_materialized_samples, dtype=np.uint8))
+                emb = embs[i].get(table_name, np.zeros(single_emb_dim))
+                combined = np.concatenate([bitmap, emb])
+                d[table_name] = combined
+            combined_sample.append(d)
+        return combined_sample
             
     return table_sample
 

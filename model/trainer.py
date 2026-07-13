@@ -30,18 +30,22 @@ def print_qerror(preds_unnorm, labels_unnorm, prints=False):
         #     qerror.append(float(labels_unnorm[i]) / float(preds_unnorm[i]))
 
     e_50, e_90 = np.median(qerror), np.percentile(qerror,90) 
+    e_80 = np.percentile(qerror, 80)
     e_95 = np.percentile(qerror, 95)
+    e_99 = np.percentile(qerror, 99)
     e_max = np.max(qerror)   
     e_mean = np.mean(qerror)
 
     if prints:
-        print('QError 50th: {:.4f}, 90th: {:.4f}, 95th: {:.4f}, Mean: {:.4f}, Max: {:.4f}'.format(
-            e_50, e_90, e_95, e_mean, e_max))
+        print('QError 50th: {:.4f}, 80th: {:.4f}, 90th: {:.4f}, 95th: {:.4f}, 99th: {:.4f}, Mean: {:.4f}, Max: {:.4f}'.format(
+            e_50, e_80, e_90, e_95, e_99, e_mean, e_max))
 
     res = {
         'q_median' : e_50,
+        'q_80' : e_80,
         'q_90' : e_90,
         'q_95' : e_95, # 【新增】加入返回值
+        'q_99' : e_99,
         'q_mean' : e_mean,
         'q_max' : e_max
     }
@@ -56,7 +60,7 @@ def get_corr(ps, ls): # unnormalised
     return corr
 
 
-def eval_workload(workload, methods, use_single_embedding=False, embedding_file=None, sample_dim=1000):
+def eval_workload(workload, methods, use_single_embedding=0, embedding_file=None, sample_dim=1000):
 
     get_table_sample = methods['get_sample']
 
@@ -267,20 +271,43 @@ def train(model, train_ds, val_ds, test_ds, crit, \
 
     evaluated_epochs = {}
 
+    import datetime
+
     for target_name, best_info in eval_targets:
         best_epoch = best_info['epoch']
-        print(f"\n--- Evaluating Model from [ {target_name} ] (Epoch {best_epoch}) ---")
+        best_num = best_info['val']
+        print(f"\n--- Evaluating Model from [ {target_name} ] with val [ {best_num} ] (Epoch {best_epoch}) ---")
         if best_epoch == -1:
             print(f"  -> Warning: No valid best epoch found for {target_name}")
             continue
+
+        if best_epoch in evaluated_epochs:
+            print(f"  -> Already evaluated. Results:")
+            scores, unnorm_preds = evaluated_epochs[best_epoch]
         else:
             target_state_dict = best_info['state_dict']
             model.load_state_dict(target_state_dict)
             model = model.to(device)
-            scores, corrs, _ = evaluate(model, test_ds, bs, norm, device, prints=False)
-            evaluated_epochs[best_epoch] = scores
-        print(f"  -> Test Set Q-Error | 50th: {scores['q_median']:.4f} | 90th: {scores['q_90']:.4f} | "
-              f"95th: {scores['q_95']:.4f} | Mean: {scores['q_mean']:.4f} | Max: {scores['q_max']:.4f}")
+            scores, corrs, unnorm_preds = evaluate(model, test_ds, bs, norm, device, prints=False)
+            evaluated_epochs[best_epoch] = (scores, unnorm_preds)
+        print(f"  -> Test Set Q-Error | 50th: {scores['q_median']:.4f} | 80th: {scores['q_80']:.4f} | 90th: {scores['q_90']:.4f} | "
+              f"95th: {scores['q_95']:.4f} | 99th: {scores['q_99']:.4f} | Mean: {scores['q_mean']:.4f} | Max: {scores['q_max']:.4f}")
+
+        if target_name == "Best Val Mean Q-Error":
+            out_dir = '/home/vipuser/QueryFormer/results'
+            if not os.path.exists(out_dir):
+                os.makedirs(out_dir)
+
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            pred_file = os.path.join(out_dir, f"pred_best_val_mean_{ts}.csv")
+
+            df_res = pd.DataFrame({
+                'pred': unnorm_preds,
+                'true': test_ds.gts
+            })
+            df_res.to_csv(pred_file, index=False, header=False)
+
+            print(f"  -> [Saved] Predictions for this model saved to: {pred_file}")
         
     print("\n" + "="*80)
     print(f"All epoch states saved to: {checkpoint_path}\n")

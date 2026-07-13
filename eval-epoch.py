@@ -6,6 +6,7 @@ import json
 import torch
 import pandas as pd
 import numpy as np
+import argparse
 
 from model.database_util import get_hist_file, get_job_table_sample, get_join_embedding
 from model.model import QueryFormer
@@ -16,19 +17,38 @@ from model.util import Normalizer, seed_everything
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-def main():
-    if len(sys.argv) != 5:
-        print("Usage: python eval_epoch.py <config_file> <path_to_all_epochs_model.pt> <epoch_number> <prediction_output_file>")
-        print("Example: python eval_epoch.py config.json ./results/full/card/exp_123/all_epochs_model.pt 55 test_predictions.csv")
-        return
-
-    config_file = sys.argv[1]
-    ckpt_path = sys.argv[2]
-    target_epoch = int(sys.argv[3])
-    pred_output_file = sys.argv[4]
+class Args:
+    bs = 512
+    embed_size = 64
+    pred_hid = 512     # 请确认是否与训练时一致 (如 256 或 512)
+    ffn_dim = 256      # 请确认是否与训练时一致 (如 256 或 1024)
+    head_size = 12
+    n_layers = 8
+    dropout = 0.1
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate a trained QueryFormer model on the test set.")
+    parser.add_argument('config_file', help='Path to config JSON file')
+    parser.add_argument('ckpt_path', help='Path to best_models.pt')
+    parser.add_argument('pred_output_file', help='Output CSV file for predictions')
+    parser.add_argument('--use_sample', type=lambda x: str(x).lower() == 'true', default=True, 
+                        help='Use sample (bitmap/embedding) in QueryFormer (default: True)')
+
+    args_parse = parser.parse_args()
+
+    config_file = args_parse.config_file
+    ckpt_path = args_parse.ckpt_path
+    pred_output_file = args_parse.pred_output_file
+
+    args = Args()
+    device = args.device
     seed_everything()
+
+    print("\nEvaluation Configuration:")
+    print(f"Config File: {config_file}")
+    print(f"Checkpoint: {ckpt_path}")
+    print(f"Use Sample: {args_parse.use_sample}")
 
     with open(config_file, 'r') as f:
         config = json.load(f)
@@ -77,36 +97,40 @@ def main():
     # 4. 初始化模型 (参数与 train.py 严格一致)
     print("Initializing Model...")
     model = QueryFormer(
-        emb_size=64, ffn_dim=128, head_size=12, dropout=0.1, n_layers=8,
-        use_sample=True, use_hist=True, pred_hid=128,
+        emb_size=args.embed_size, ffn_dim=args.ffn_dim, head_size=args.head_size, dropout=args.dropout, n_layers=args.n_layers,
+        use_hist=True, pred_hid=args.pred_hid,
         sample_dim=config['sample_dim'], max_filters=config['max_filters'],
         use_join_embedding=config['use_join_embedding'], join_dim=config['join_embedding_dim'],
         num_tables=len(encoding.table2idx) + 10,
         num_types=len(encoding.type2idx) + 10,
         num_joins=len(encoding.join2idx) + 10,
         num_columns=len(encoding.col2idx) + 10,
-        num_ops=len(encoding.op2idx) + 10
+        num_ops=len(encoding.op2idx) + 10,
+        use_single_embedding=config['use_single_embedding'],
+        use_sample = args_parse.use_sample
     )
 
     # 5. 从包含所有 epoch 的文件中抽取特定的 epoch 状态
-    print(f"Loading weights for Epoch {target_epoch} from {ckpt_path}...")
+    print(f"Loading checkpoint from {ckpt_path}...")
     if not os.path.exists(ckpt_path):
-        print("Checkpoint file not found!")
+        print("Error: Checkpoint file not found!")
         return
 
-    all_checkpoints = torch.load(ckpt_path, map_location='cpu')
-    if target_epoch not in all_checkpoints:
-        print(f"Error: Epoch {target_epoch} not found in the checkpoint file.")
-        print(f"Available epochs are: {sorted(list(all_checkpoints.keys()))}")
-        return
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    
+    # 提取在 Validation Set 上 Mean Q-Error 最好的模型
+    target_state_dict = checkpoint['models']['val_mean']
+    best_epoch = checkpoint['meta']['val_mean_epoch']
 
-    model.load_state_dict(all_checkpoints[target_epoch])
+    print(f"Successfully extracted model weights. This model achieved the best Validation Mean Q-Error at Epoch {best_epoch}.")
+
+    model.load_state_dict(target_state_dict)
     model = model.to(device)
 
     # 6. 评估
-    print(f"\n--- Evaluating Epoch {target_epoch} on Test Set ---")
+    print(f"\n--- Evaluating Model (from Epoch {best_epoch}) on Test Set ---")
     # 使用 1024 的 batch size 以加快推理速度
-    scores, corrs, unnorm_preds = evaluate(model, test_ds, bs=1024, norm=card_norm, device=device, prints=True)
+    scores, corrs, unnorm_preds = evaluate(model, test_ds, bs=args.bs, norm=card_norm, device=device, prints=True)
 
     # 7. 保存预测结果
     df_res = pd.DataFrame({
